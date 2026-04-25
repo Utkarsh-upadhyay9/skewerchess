@@ -12,9 +12,8 @@ dependencies = [
     "mlx>=0.21.0",
     "mlx-lm>=0.20.0",
 
-    # Chess
-    "python-chess>=1.999",
-    "stockfish>=3.28.0",
+    # Chess (python-chess includes its own UCI engine interface)
+    "python-chess>=1.11.0",
 
     # Hugging Face ecosystem (interop with MLX)
     "transformers>=4.46.0",

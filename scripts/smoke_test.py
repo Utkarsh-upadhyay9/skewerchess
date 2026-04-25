@@ -82,15 +82,21 @@ def main() -> int:
         moves = list(game.mainline_moves()) if game else []
         chk.info(f"parsed {len(moves)} moves, version {chess.__version__}")
 
-    chk = Check("Stockfish binary at $STOCKFISH_PATH")
+    chk = Check("Stockfish via python-chess UCI engine")
     CHECKS.append(chk)
     with chk:
-        from stockfish import Stockfish
+        import chess
+        import chess.engine
         sf_path = os.getenv("STOCKFISH_PATH", "/opt/homebrew/bin/stockfish")
-        sf = Stockfish(path=sf_path, depth=10)
-        sf.set_position([])
-        best = sf.get_best_move()
-        chk.info(f"opening best move: {best}")
+        engine = chess.engine.SimpleEngine.popen_uci(sf_path)
+        try:
+            board = chess.Board()
+            info = engine.analyse(board, chess.engine.Limit(depth=12), multipv=3)
+            top_moves = [board.san(line["pv"][0]) for line in info]
+            evals = [line["score"].white().score(mate_score=10000) for line in info]
+            chk.info(f"depth=12 multipv=3: top moves {top_moves}, evals {evals}")
+        finally:
+            engine.quit()
 
     section("2. Apple Silicon ML stack")
     chk = Check("MLX tensor math on GPU")
