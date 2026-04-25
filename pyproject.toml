@@ -1,0 +1,101 @@
+[project]
+name = "skewerchess"
+version = "0.1.0"
+description = "An AI chess coach that explains your games like a 2500-rated trainer would. Distilled into a small open model that runs on Apple Silicon."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Utkarsh Upadhyay" }]
+
+dependencies = [
+    # Apple Silicon ML stack
+    "mlx>=0.21.0",
+    "mlx-lm>=0.20.0",
+
+    # Chess
+    "python-chess>=1.999",
+    "stockfish>=3.28.0",
+
+    # Hugging Face ecosystem (interop with MLX)
+    "transformers>=4.46.0",
+    "datasets>=3.0.0",
+    "tokenizers>=0.20.0",
+    "huggingface-hub>=0.26.0",
+
+    # Backend / API (used in Week 3)
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.5.0",
+
+    # HTTP clients
+    "httpx>=0.27.0",
+    "aiohttp>=3.10.0",
+    "tenacity>=9.0.0",
+
+    # Data
+    "polars>=1.10.0",
+    "pandas>=2.2.0",
+    "numpy>=2.0.0",
+    "pyarrow>=17.0.0",
+
+    # ML utils
+    "scikit-learn>=1.5.0",
+
+    # Teacher model SDKs (free tiers)
+    "google-genai>=0.3.0",
+    "groq>=0.11.0",
+
+    # CLI / logging
+    "typer>=0.13.0",
+    "rich>=13.9.0",
+    "tqdm>=4.66.0",
+    "loguru>=0.7.2",
+
+    # Config
+    "python-dotenv>=1.0.0",
+
+    # Storage
+    "duckdb>=1.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.7.0",
+    "mypy>=1.13.0",
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "ipykernel>=6.29.0",
+    "jupyterlab>=4.3.0",
+]
+deploy = [
+    "modal>=0.66.0",
+]
+
+[project.scripts]
+skewer = "packages.ml.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["packages/ml"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["data", "notebooks"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
