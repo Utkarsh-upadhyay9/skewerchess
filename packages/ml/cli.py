@@ -24,6 +24,13 @@ ingest_app = typer.Typer(
 )
 app.add_typer(ingest_app, name="ingest")
 
+annotate_app = typer.Typer(
+    name="annotate",
+    help="Run Stockfish + concept tagger over ingested games.",
+    no_args_is_help=True,
+)
+app.add_typer(annotate_app, name="annotate")
+
 db_app = typer.Typer(
     name="db",
     help="Inspect the local data warehouse.",
@@ -95,6 +102,118 @@ def ingest_lichess(
     for k, v in stats.items():
         table.add_row(k, str(v))
     Console().print(table)
+
+
+# ---- annotate subcommands -------------------------------------------------
+
+
+@annotate_app.command("run")
+def annotate_run(
+    max_games: int = typer.Option(
+        None, "--max-games", "-n", help="Cap on games to annotate (default: all unannotated)."
+    ),
+    depth: int = typer.Option(
+        16, "--depth", help="Stockfish search depth (used only if --time is not set)."
+    ),
+    time_per_move: float = typer.Option(
+        0.1, "--time", help="Seconds Stockfish spends per position (overrides --depth if > 0)."
+    ),
+    multipv: int = typer.Option(3, "--multipv", help="Number of top engine lines to record."),
+    workers: int = typer.Option(
+        0,
+        "--workers",
+        "-w",
+        help="Parallel Stockfish processes. 0 = auto (CPU-2, capped at 6).",
+    ),
+) -> None:
+    """Annotate all unannotated games with Stockfish evaluations + concept tags."""
+    from packages.ml.data.annotate import annotate_games, default_workers
+
+    if workers <= 0:
+        workers = default_workers()
+    tpm = time_per_move if time_per_move and time_per_move > 0 else None
+
+    print(
+        f"[bold]Annotating[/bold]: depth={depth} time={tpm}s multipv={multipv} "
+        f"workers={workers} max_games={max_games or 'all'}"
+    )
+
+    stats = annotate_games(
+        max_games=max_games,
+        depth=depth,
+        time_per_move=tpm,
+        multipv=multipv,
+        workers=workers,
+    )
+
+    table = Table(title="Annotation results")
+    table.add_column("metric", style="cyan")
+    table.add_column("value", style="bold")
+    for k, v in stats.items():
+        table.add_row(k, str(v))
+    Console().print(table)
+
+
+@annotate_app.command("stats")
+def annotate_stats() -> None:
+    """Show annotation coverage and move-classification distribution."""
+    from packages.ml.data.store import connect
+
+    with connect() as con:
+        coverage = con.execute(
+            """
+            SELECT
+              (SELECT count(*) FROM games) AS total_games,
+              (SELECT count(DISTINCT game_id) FROM annotations) AS annotated_games,
+              (SELECT count(*) FROM annotations) AS total_positions
+            """
+        ).fetchone()
+        ct = Table(title="Coverage")
+        ct.add_column("metric", style="cyan")
+        ct.add_column("value", justify="right", style="bold")
+        ct.add_row("total games", f"{coverage[0]:,}")
+        ct.add_row("annotated games", f"{coverage[1]:,}")
+        ct.add_row("annotated positions", f"{coverage[2]:,}")
+        Console().print(ct)
+
+        if coverage[2] == 0:
+            return
+
+        rows = con.execute(
+            """
+            SELECT classification, count(*) AS n,
+                   round(avg(eval_drop_cp)) AS avg_drop_cp
+            FROM annotations
+            GROUP BY classification
+            ORDER BY array_position(
+                ['best','great','good','inaccuracy','mistake','blunder']::VARCHAR[],
+                classification
+            )
+            """
+        ).fetchall()
+        ct2 = Table(title="Move classification distribution")
+        ct2.add_column("classification")
+        ct2.add_column("count", justify="right")
+        ct2.add_column("avg drop (cp)", justify="right")
+        for cls, n, drop in rows:
+            ct2.add_row(str(cls), f"{n:,}", str(int(drop)) if drop else "0")
+        Console().print(ct2)
+
+        tag_rows = con.execute(
+            """
+            SELECT tag, count(*) AS n
+            FROM (SELECT unnest(concept_tags) AS tag FROM annotations)
+            GROUP BY tag
+            ORDER BY n DESC
+            LIMIT 15
+            """
+        ).fetchall()
+        ct3 = Table(title="Top 15 concept tags")
+        ct3.add_column("tag")
+        ct3.add_column("positions", justify="right")
+        for tag, n in tag_rows:
+            ct3.add_row(str(tag), f"{n:,}")
+        Console().print(ct3)
 
 
 # ---- db subcommands --------------------------------------------------------
