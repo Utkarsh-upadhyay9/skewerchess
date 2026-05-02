@@ -31,6 +31,13 @@ annotate_app = typer.Typer(
 )
 app.add_typer(annotate_app, name="annotate")
 
+teach_app = typer.Typer(
+    name="teach",
+    help="Generate teacher-LLM coaching explanations for sampled positions.",
+    no_args_is_help=True,
+)
+app.add_typer(teach_app, name="teach")
+
 db_app = typer.Typer(
     name="db",
     help="Inspect the local data warehouse.",
@@ -214,6 +221,239 @@ def annotate_stats() -> None:
         for tag, n in tag_rows:
             ct3.add_row(str(tag), f"{n:,}")
         Console().print(ct3)
+
+
+# ---- teach subcommands ----------------------------------------------------
+
+
+@teach_app.command("sample")
+def teach_sample(
+    n: int = typer.Option(20, "--n", "-n", help="How many samples to preview."),
+    teacher: str = typer.Option(
+        "gemini-2.5-flash",
+        "--teacher",
+        help="Teacher name (controls already-done filter).",
+    ),
+    seed: int = typer.Option(42, "--seed", help="Sampling seed."),
+) -> None:
+    """Preview which positions would be selected for teacher generation."""
+    from packages.ml.data.teacher import sample_positions
+
+    samples = sample_positions(n_samples=n, teacher_model=teacher, seed=seed)
+    if not samples:
+        print("[yellow]no samples found — annotations table is empty?[/yellow]")
+        return
+    t = Table(title=f"Sampled {len(samples)} positions")
+    for col in ("game", "ply", "phase", "class", "drop", "move", "best", "tags"):
+        t.add_column(col)
+    for s in samples[:n]:
+        tags = ",".join(s.concept_tags[:3])
+        if len(s.concept_tags) > 3:
+            tags += f"+{len(s.concept_tags)-3}"
+        t.add_row(
+            s.game_id.split(":")[-1][:8],
+            str(s.ply),
+            s.phase,
+            s.classification,
+            str(s.eval_drop_cp) if s.eval_drop_cp is not None else "?",
+            s.move_san,
+            s.best_pv_san or "—",
+            tags or "—",
+        )
+    Console().print(t)
+
+
+@teach_app.command("inspect")
+def teach_inspect(
+    game_id: str = typer.Argument(..., help="Game id, e.g. lichess:abc12345."),
+    ply: int = typer.Argument(..., help="Half-move number."),
+    teacher: str = typer.Option(
+        "gemini-2.5-flash",
+        "--teacher",
+        help="Teacher whose explanation to display (if any exists).",
+    ),
+) -> None:
+    """Print the prompt that would be sent + any existing teacher explanation."""
+    from packages.ml.data.store import connect
+    from packages.ml.data.teacher import (
+        PROMPT_VERSION,
+        _row_to_sample,
+        build_prompt,
+    )
+
+    with connect() as con:
+        row = con.execute(
+            """
+            SELECT
+                a.game_id, a.ply, a.fen, a.side_to_move,
+                a.move_san, a.move_uci, a.eval_cp, a.eval_mate,
+                a.best_pv_san, a.multipv2_san, a.multipv3_san,
+                a.eval_drop_cp, a.classification, a.concept_tags,
+                g.white_elo, g.black_elo, g.result, g.pgn
+            FROM annotations a JOIN games g ON a.game_id = g.id
+            WHERE a.game_id = ? AND a.ply = ?
+            """,
+            [game_id, ply],
+        ).fetchone()
+        if not row:
+            print(f"[red]no annotation for {game_id} ply {ply}[/red]")
+            return
+        sample = _row_to_sample(row)
+        if sample is None:
+            print("[red]could not reconstruct fen_before from PGN[/red]")
+            return
+
+        existing = con.execute(
+            """
+            SELECT explanation FROM teacher
+            WHERE game_id = ? AND ply = ? AND teacher_model = ? AND prompt_version = ?
+            """,
+            [game_id, ply, teacher, PROMPT_VERSION],
+        ).fetchone()
+
+    print("[bold cyan]PROMPT[/bold cyan]")
+    print(build_prompt(sample))
+    print("\n[bold cyan]EXISTING EXPLANATION[/bold cyan]")
+    if existing:
+        print(existing[0])
+    else:
+        print("[dim](none — run `skewer teach run` first)[/dim]")
+
+
+@teach_app.command("run")
+def teach_run(
+    n: int = typer.Option(100, "--n", "-n", help="Number of samples to generate."),
+    teacher: str = typer.Option(
+        "gemini-2.5-flash",
+        "--teacher",
+        help="One of: gemini, gemini-2.5-flash, groq, llama-3.3-70b-versatile.",
+    ),
+    rpm: int = typer.Option(
+        0,
+        "--rpm",
+        help="Override requests-per-minute. 0 = default for the chosen teacher.",
+    ),
+    seed: int = typer.Option(42, "--seed"),
+    skip_done: bool = typer.Option(
+        True,
+        "--skip-done/--include-done",
+        help="Skip positions already explained by this teacher (default true).",
+    ),
+) -> None:
+    """Generate teacher explanations for ``n`` sampled positions."""
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+
+    from packages.ml.data.teacher import (
+        GeminiTeacher,
+        GroqTeacher,
+        generate_explanations,
+        sample_positions,
+    )
+
+    n_lower = teacher.lower()
+    if n_lower.startswith("gemini"):
+        client = GeminiTeacher(model=teacher, rpm=rpm or 10)
+    elif "llama" in n_lower or n_lower in ("groq",):
+        model = "llama-3.3-70b-versatile" if n_lower == "groq" else teacher
+        client = GroqTeacher(model=model, rpm=rpm or 30)
+    else:
+        print(f"[red]unknown teacher: {teacher}[/red]")
+        raise typer.Exit(1)
+
+    samples = sample_positions(
+        n_samples=n,
+        teacher_model=client.name if skip_done else None,
+        exclude_already_done=skip_done,
+        seed=seed,
+    )
+    if not samples:
+        print("[yellow]no samples to generate — annotations empty or all done.[/yellow]")
+        return
+
+    print(
+        f"[bold]Generating[/bold] {len(samples)} explanations via "
+        f"[bold]{client.name}[/bold]"
+    )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]teacher[/bold]"),
+        BarColumn(bar_width=None),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+    ) as bar:
+        task = bar.add_task("samples", total=len(samples))
+
+        def _on_progress(idx: int, total: int, _stats) -> None:
+            bar.update(task, completed=idx)
+
+        stats = generate_explanations(samples, client, on_progress=_on_progress)
+
+    t = Table(title="Teacher generation results")
+    t.add_column("metric", style="cyan")
+    t.add_column("value", style="bold")
+    t.add_row("requested", str(stats.requested))
+    t.add_row("succeeded", str(stats.succeeded))
+    t.add_row("failed (validation)", str(stats.failed_validation))
+    t.add_row("failed (API)", str(stats.failed_api))
+    t.add_row("tokens in", f"{stats.tokens_in:,}")
+    t.add_row("tokens out", f"{stats.tokens_out:,}")
+    t.add_row("seconds", f"{stats.seconds:.1f}")
+    Console().print(t)
+
+    if stats.failures_sample:
+        print("\n[yellow]first failures:[/yellow]")
+        for f in stats.failures_sample:
+            print(f"  • {f}")
+
+
+@teach_app.command("stats")
+def teach_stats() -> None:
+    """Show teacher coverage by model + a few example explanations."""
+    from packages.ml.data.store import connect
+
+    with connect() as con:
+        coverage = con.execute(
+            """
+            SELECT teacher_model, prompt_version, count(*) AS n,
+                   sum(cost_tokens_in) AS in_tok, sum(cost_tokens_out) AS out_tok
+            FROM teacher
+            GROUP BY teacher_model, prompt_version
+            ORDER BY n DESC
+            """
+        ).fetchall()
+        if not coverage:
+            print("[yellow]teacher table is empty — run `skewer teach run` first[/yellow]")
+            return
+        t = Table(title="Teacher coverage")
+        for col in ("model", "prompt", "rows", "tokens_in", "tokens_out"):
+            t.add_column(col)
+        for model, ver, n, ti, to in coverage:
+            t.add_row(model, ver, f"{n:,}", f"{ti or 0:,}", f"{to or 0:,}")
+        Console().print(t)
+
+        ex = con.execute(
+            """
+            SELECT t.teacher_model, t.game_id, t.ply, a.classification, a.move_san, t.explanation
+            FROM teacher t JOIN annotations a USING (game_id, ply)
+            ORDER BY random()
+            LIMIT 3
+            """
+        ).fetchall()
+        for model, gid, ply, cls, san, expl in ex:
+            print(f"\n[bold cyan]{model}[/bold cyan] {gid} ply {ply} ({cls}, {san}):")
+            print(expl)
 
 
 # ---- db subcommands --------------------------------------------------------
