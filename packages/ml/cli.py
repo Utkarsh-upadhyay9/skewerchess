@@ -38,6 +38,20 @@ teach_app = typer.Typer(
 )
 app.add_typer(teach_app, name="teach")
 
+train_app = typer.Typer(
+    name="train",
+    help="Build datasets and fine-tune the on-device chess coach (QLoRA on MLX).",
+    no_args_is_help=True,
+)
+app.add_typer(train_app, name="train")
+
+infer_app = typer.Typer(
+    name="infer",
+    help="Run the trained student model on a single position.",
+    no_args_is_help=True,
+)
+app.add_typer(infer_app, name="infer")
+
 db_app = typer.Typer(
     name="db",
     help="Inspect the local data warehouse.",
@@ -496,6 +510,146 @@ def teach_stats() -> None:
         for model, gid, ply, cls, san, expl in ex:
             print(f"\n[bold cyan]{model}[/bold cyan] {gid} ply {ply} ({cls}, {san}):")
             print(expl)
+
+
+# ---- train subcommands ----------------------------------------------------
+
+
+@train_app.command("build-dataset")
+def train_build_dataset(
+    teacher: str = typer.Option(
+        None,
+        "--teacher",
+        help="Restrict to one teacher model (default: use any teacher).",
+    ),
+    out_dir: str = typer.Option(
+        None,
+        "--out-dir",
+        help="Where to write train/val/test.jsonl (default: data/datasets/coach-vN/).",
+    ),
+    no_revalidate: bool = typer.Option(
+        False,
+        "--no-revalidate",
+        help="Skip re-running the validator on cached teacher rows.",
+    ),
+) -> None:
+    """Materialize the instruction-tuning JSONL splits MLX-LM expects."""
+    from pathlib import Path as _P
+
+    from packages.ml.training.dataset import write_dataset
+
+    target = _P(out_dir) if out_dir else None
+    stats = write_dataset(
+        out_dir=target, teacher_model=teacher, revalidate=not no_revalidate
+    )
+    t = Table(title="Dataset build")
+    t.add_column("split", style="cyan")
+    t.add_column("rows", justify="right", style="bold")
+    t.add_row("train", f"{stats.train:,}")
+    t.add_row("val", f"{stats.val:,}")
+    t.add_row("test", f"{stats.test:,}")
+    t.add_row("total", f"{stats.total:,}")
+    Console().print(t)
+    if stats.total < 200:
+        print(
+            "[yellow]warning:[/yellow] fewer than 200 examples — training "
+            "will likely overfit. Generate more teacher data first."
+        )
+
+
+@train_app.command("config")
+def train_config_show() -> None:
+    """Print the current training config (resolved from settings + defaults)."""
+    from packages.ml.training.train import TrainConfig, dataset_summary
+
+    cfg = TrainConfig.default()
+    t = Table(title="Training config")
+    t.add_column("key", style="cyan")
+    t.add_column("value", style="bold")
+    for k in (
+        "base_model",
+        "data_dir",
+        "adapters_dir",
+        "iters",
+        "batch_size",
+        "learning_rate",
+        "lora_rank",
+        "lora_alpha",
+        "max_seq_len",
+        "grad_checkpoint",
+        "save_every",
+    ):
+        t.add_row(k, str(getattr(cfg, k)))
+    Console().print(t)
+    if cfg.data_dir.exists():
+        try:
+            print("\n[bold]Dataset on disk[/bold]:", dataset_summary(cfg))
+        except Exception as e:
+            print(f"[yellow]could not read dataset: {e}[/yellow]")
+
+
+@train_app.command("run")
+def train_run(
+    iters: int = typer.Option(0, "--iters", help="Override TRAIN_ITERS (0 = use default)."),
+) -> None:
+    """Launch QLoRA training via mlx_lm.lora as a subprocess."""
+    from packages.ml.training.train import TrainConfig, run_training
+
+    cfg = TrainConfig.default(iters=iters or None)
+    rc = run_training(cfg)
+    if rc != 0:
+        raise typer.Exit(rc)
+
+
+# ---- infer subcommands ----------------------------------------------------
+
+
+@infer_app.command("run")
+def infer_run(
+    fen: str = typer.Argument(..., help="Position FEN before the move."),
+    move: str = typer.Argument(..., help="The move played in SAN, e.g. 'Nxf6+'."),
+    color: str = typer.Option(
+        "w",
+        "--color",
+        help="Side that played the move ('w' or 'b').",
+    ),
+    classification: str = typer.Option(
+        "mistake",
+        "--class",
+        help="One of best/great/good/inaccuracy/mistake/blunder.",
+    ),
+    fullmove: int = typer.Option(
+        1, "--fullmove", help="Fullmove number (default 1)."
+    ),
+    adapter: str = typer.Option(
+        None, "--adapter", help="Adapter directory (default: latest coach-vN)."
+    ),
+    max_tokens: int = typer.Option(220, "--max-tokens"),
+    temperature: float = typer.Option(0.7, "--temperature"),
+) -> None:
+    """Generate a coaching explanation for one position."""
+    from packages.ml.inference.coach import coach
+
+    if color not in ("w", "b"):
+        print("[red]--color must be 'w' or 'b'[/red]")
+        raise typer.Exit(1)
+
+    resp = coach(
+        fen_before=fen,
+        move_san=move,
+        mover_color=color,
+        classification=classification,
+        fullmove_number=fullmove,
+        adapter_path=adapter,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    print(f"[bold cyan]Explanation:[/bold cyan]\n{resp.explanation}")
+    print(
+        f"\n[dim]tokens_in={resp.tokens_in} "
+        f"tokens_out={resp.tokens_out} "
+        f"seconds={resp.seconds:.2f}[/dim]"
+    )
 
 
 # ---- db subcommands --------------------------------------------------------

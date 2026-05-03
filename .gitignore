@@ -35,6 +35,7 @@ out/
 # --- Data + models (huge, gitignored) ---
 data/raw/
 data/processed/
+data/datasets/
 data/models/
 data/cache/
 data/*.sqlite
