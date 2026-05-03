@@ -227,6 +227,34 @@ def test_validator_rejects_too_short() -> None:
     assert "short" in reason
 
 
+def test_validator_rejects_truncated_mid_sentence() -> None:
+    """Real failure mode from Gemini 2.5 Flash thinking-mode output cap.
+
+    The text ends mid-sentence with no terminator — must be rejected even if
+    it passes the length threshold.
+    """
+    sample = _scholar_blunder_sample()
+    text = (
+        "You played Nf6, which was a significant misstep allowing white to "
+        "land a quick attack on the kingside before you could finish "
+        "developing the knight to a square that"
+    )
+    ok, reason = validate_explanation(text, sample)
+    assert not ok
+    assert "truncated" in reason
+
+
+def test_validator_accepts_clean_explanation_ending_in_period() -> None:
+    sample = _scholar_blunder_sample()
+    text = (
+        "After Nf6 you fail to defend f7, where white's queen and bishop "
+        "team up for mate. Qe7 was the cleanest defense, blocking the "
+        "diagonal and trading off the most exposed defender."
+    )
+    ok, reason = validate_explanation(text, sample)
+    assert ok, reason
+
+
 def test_validator_rejects_eval_numbers() -> None:
     sample = _scholar_blunder_sample()
     text = (

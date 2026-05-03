@@ -418,6 +418,48 @@ def teach_run(
             print(f"  • {f}")
 
 
+@teach_app.command("purge")
+def teach_purge(
+    teacher: str = typer.Option(
+        ...,
+        "--teacher",
+        help="Teacher whose rows to delete (must match exactly).",
+    ),
+    prompt_version: str = typer.Option(
+        "v1", "--prompt-version", help="Prompt version to delete (default v1)."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
+) -> None:
+    """Delete teacher rows for a given (teacher, prompt_version) pair.
+
+    Use this when an early run produced bad data (e.g. Gemini truncation) and
+    you want to regenerate cleanly. The annotations table is untouched.
+    """
+    from packages.ml.data.store import connect
+
+    with connect() as con:
+        n = con.execute(
+            "SELECT count(*) FROM teacher WHERE teacher_model = ? AND prompt_version = ?",
+            [teacher, prompt_version],
+        ).fetchone()[0]
+
+    if n == 0:
+        print(f"[yellow]no rows for {teacher} {prompt_version}[/yellow]")
+        return
+    if not yes:
+        confirmed = typer.confirm(f"Delete {n} rows for {teacher} {prompt_version}?")
+        if not confirmed:
+            print("[yellow]aborted[/yellow]")
+            return
+
+    with connect() as con:
+        con.execute(
+            "DELETE FROM teacher WHERE teacher_model = ? AND prompt_version = ?",
+            [teacher, prompt_version],
+        )
+    print(f"[green]deleted {n} rows[/green]")
+
+
 @teach_app.command("stats")
 def teach_stats() -> None:
     """Show teacher coverage by model + a few example explanations."""

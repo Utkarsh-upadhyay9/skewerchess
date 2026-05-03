@@ -399,15 +399,30 @@ def _legal_san_set(fen: str) -> set[str]:
     return out
 
 
+SENTENCE_TERMINATORS = (".", "!", "?", '"', "”", "’", ".\"", ".'")
+
+
+def _looks_truncated(text: str) -> bool:
+    """Heuristic: the LLM ran out of output tokens mid-sentence."""
+    last = text.rstrip()
+    if not last:
+        return False
+    if last.endswith(SENTENCE_TERMINATORS):
+        return False
+    return True
+
+
 def validate_explanation(text: str, sample: TeacherSample) -> tuple[bool, str]:
     """Return (ok, reason). Cheap heuristic checks; doesn't try to be perfect."""
     text = text.strip()
     if not text:
         return False, "empty"
-    if len(text) < 40:
+    if len(text) < 80:
         return False, "too short"
     if len(text) > 1200:
         return False, "too long"
+    if _looks_truncated(text):
+        return False, "truncated mid-sentence"
     # Reject if it embeds large eval numbers (we asked it not to).
     if re.search(r"\b\d+\s*cp\b|\b\d+\s*centipawns\b|\(\+?-?\d+\.\d+\)", text):
         return False, "cites raw eval numbers"
@@ -496,38 +511,85 @@ class _RateLimiter:
 
 
 class GeminiTeacher:
-    """Google Gemini 2.5 Flash via the public free tier."""
+    """Google Gemini 2.5 Flash via the public free tier.
 
-    def __init__(self, model: str | None = None, rpm: int = 10):
+    Important detail for 2.5-series models: by default Gemini reasons in
+    "thinking" tokens that count against ``max_output_tokens`` *before* any
+    visible response is emitted, which can leave the actual answer
+    truncated mid-sentence. For coaching annotations the engine has already
+    done the analysis — the LLM only needs to translate facts into prose —
+    so we explicitly disable thinking by setting ``thinking_budget=0``.
+    """
+
+    def __init__(
+        self,
+        model: str | None = None,
+        rpm: int = 10,
+        max_output_tokens: int = 512,
+        thinking_budget: int = 0,
+    ):
         from google import genai  # lazy import — keeps module importable in tests
 
         self.name = model or settings.teacher_model or "gemini-2.5-flash"
         self._client = genai.Client(api_key=settings.gemini_api_key)
         self._rl = _RateLimiter(rpm)
+        self._max_output_tokens = max_output_tokens
+        self._thinking_budget = thinking_budget
 
-    def generate(self, prompt: str) -> tuple[str, TeacherUsage]:
+    def _build_config(self):
         from google.genai import types as genai_types
 
+        kwargs: dict = dict(
+            temperature=0.7,
+            max_output_tokens=self._max_output_tokens,
+            response_mime_type="text/plain",
+        )
+        # ``thinking_config`` is supported on 2.5-series models; older models
+        # silently ignore it. Setting budget=0 disables thinking entirely.
+        try:
+            kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                thinking_budget=self._thinking_budget,
+            )
+        except Exception:
+            pass
+        return genai_types.GenerateContentConfig(**kwargs)
+
+    def generate(self, prompt: str) -> tuple[str, TeacherUsage]:
         self._rl.acquire()
         t0 = time.monotonic()
         resp = self._client.models.generate_content(
             model=self.name,
             contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                temperature=0.7,
-                max_output_tokens=320,
-                response_mime_type="text/plain",
-            ),
+            config=self._build_config(),
         )
         dt = time.monotonic() - t0
 
         text = (resp.text or "").strip()
         usage_meta = getattr(resp, "usage_metadata", None)
+        tokens_out = getattr(usage_meta, "candidates_token_count", 0) or 0
         usage = TeacherUsage(
             tokens_in=getattr(usage_meta, "prompt_token_count", 0) or 0,
-            tokens_out=getattr(usage_meta, "candidates_token_count", 0) or 0,
+            tokens_out=tokens_out,
             seconds=dt,
         )
+
+        # Surface MAX_TOKENS truncation early — this is exactly the failure
+        # mode 2.5 Flash exhibits when thinking_budget gobbles up the cap.
+        finish = None
+        try:
+            finish = resp.candidates[0].finish_reason
+            if hasattr(finish, "name"):
+                finish = finish.name
+            finish = str(finish or "").upper()
+        except Exception:
+            pass
+        if finish and "MAX_TOKEN" in finish:
+            logger.warning(
+                f"[{self.name}] response truncated by max_output_tokens "
+                f"(out={tokens_out}); raise --max-output-tokens or check "
+                f"thinking_budget"
+            )
+
         return text, usage
 
 
