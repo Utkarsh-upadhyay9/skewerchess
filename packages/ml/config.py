@@ -50,5 +50,17 @@ class Settings(BaseSettings):
     learning_rate: float = Field(default=2e-4, alias="LEARNING_RATE")
     train_iters: int = Field(default=2000, alias="TRAIN_ITERS")
 
+    # === HTTP API (FastAPI) ===
+    coach_backend: str = Field(
+        default="mock",
+        alias="COACH_BACKEND",
+        description="mock | mlx — student model at inference; mock needs no GPU.",
+    )
+    cors_origins: str = Field(
+        default="*",
+        alias="CORS_ORIGINS",
+        description="Comma-separated origins for CORS, or * for dev.",
+    )
+
 
 settings = Settings()

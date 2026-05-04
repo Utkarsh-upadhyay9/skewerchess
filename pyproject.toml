@@ -76,6 +76,7 @@ deploy = [
 
 [project.scripts]
 skewer = "packages.ml.cli:app"
+skewer-api = "packages.ml.api.main:run"
 
 [build-system]
 requires = ["hatchling"]
