@@ -424,7 +424,15 @@ def teach_run(
     t.add_row("tokens in", f"{stats.tokens_in:,}")
     t.add_row("tokens out", f"{stats.tokens_out:,}")
     t.add_row("seconds", f"{stats.seconds:.1f}")
+    if stats.aborted_quota:
+        t.add_row("aborted", "yes (quota hit)")
     Console().print(t)
+
+    if stats.aborted_quota:
+        print(
+            "\n[yellow]daily quota reached — re-run the same command tomorrow "
+            "to continue (already-done positions are skipped automatically).[/yellow]"
+        )
 
     if stats.failures_sample:
         print("\n[yellow]first failures:[/yellow]")

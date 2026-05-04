@@ -642,10 +642,27 @@ class GenStats:
     succeeded: int = 0
     failed_validation: int = 0
     failed_api: int = 0
+    aborted_quota: bool = False
     tokens_in: int = 0
     tokens_out: int = 0
     seconds: float = 0.0
     failures_sample: list[str] = field(default_factory=list)
+
+
+# Substrings that mean "your daily quota is gone, stop trying for today".
+# Both Gemini (RESOURCE_EXHAUSTED) and Groq (rate_limit_exceeded) emit
+# distinctive HTTP 429 wording; we match conservatively to avoid false alarms.
+_QUOTA_MARKERS = (
+    "RESOURCE_EXHAUSTED",
+    "rate_limit_exceeded",
+    "quota",
+    "429",
+)
+
+
+def _looks_like_quota_error(err: str) -> bool:
+    s = err.lower()
+    return any(m.lower() in s for m in _QUOTA_MARKERS)
 
 
 def insert_teacher_row(
@@ -683,6 +700,7 @@ def generate_explanations(
     client: TeacherClient,
     *,
     max_retries: int = 2,
+    quota_abort_after: int = 5,
     on_progress: Callable[[int, int, GenStats], None] | None = None,
 ) -> GenStats:
     """Iterate ``samples``, call ``client``, validate, write to ``teacher`` table.
@@ -690,19 +708,28 @@ def generate_explanations(
     Idempotent (PK = game_id, ply, teacher_model, prompt_version) — re-running
     on already-done rows simply overwrites them. The orchestrator does NOT
     skip already-done rows; the sampler does that.
+
+    If ``quota_abort_after`` consecutive samples fail with quota/rate-limit
+    errors, the loop aborts early and ``stats.aborted_quota`` is set. This
+    avoids hours of pointless retries once a daily ceiling has been hit —
+    just resume tomorrow with the same command (sampler skips done rows).
     """
     stats = GenStats(requested=len(samples))
     started = time.monotonic()
+    consecutive_quota = 0
 
     for idx, sample in enumerate(samples, start=1):
         prompt = build_prompt(sample)
 
         last_err: str | None = None
+        sample_hit_quota = False
         for attempt in range(max_retries + 1):
             try:
                 text, usage = client.generate(prompt)
             except Exception as e:
                 last_err = f"api: {type(e).__name__}: {e}"
+                if _looks_like_quota_error(last_err):
+                    sample_hit_quota = True
                 wait = 2 ** attempt
                 logger.warning(
                     f"[{client.name}] {sample.game_id}#{sample.ply} api error "
@@ -735,13 +762,28 @@ def generate_explanations(
         if last_err is not None:
             if last_err.startswith("validation"):
                 stats.failed_validation += 1
+                consecutive_quota = 0
             else:
                 stats.failed_api += 1
+                if sample_hit_quota:
+                    consecutive_quota += 1
+                else:
+                    consecutive_quota = 0
             if len(stats.failures_sample) < 10:
                 stats.failures_sample.append(f"{sample.game_id}#{sample.ply}: {last_err}")
+        else:
+            consecutive_quota = 0
 
         if on_progress is not None:
             on_progress(idx, len(samples), stats)
+
+        if quota_abort_after > 0 and consecutive_quota >= quota_abort_after:
+            stats.aborted_quota = True
+            logger.warning(
+                f"[{client.name}] aborting early after {consecutive_quota} "
+                f"consecutive quota errors — re-run tomorrow to resume."
+            )
+            break
 
     stats.seconds = time.monotonic() - started
     return stats

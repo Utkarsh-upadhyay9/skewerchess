@@ -403,6 +403,46 @@ def test_generate_explanations_records_validation_failures(tmp_db) -> None:
     assert stats.failures_sample  # some failures were captured
 
 
+@dataclass
+class _QuotaClient:
+    """Always raises a 429-shaped error to simulate daily quota exhaustion."""
+
+    name: str = "mock-quota"
+    raised: int = 0
+
+    def generate(self, prompt: str) -> tuple[str, TeacherUsage]:
+        self.raised += 1
+        raise RuntimeError(
+            "ClientError: 429 RESOURCE_EXHAUSTED. Quota exceeded for metric: ..."
+        )
+
+
+def test_generate_explanations_aborts_on_consecutive_quota_errors(tmp_db) -> None:
+    """When N consecutive samples all hit a quota error, the loop must break
+    early — not waste hours retrying samples that can't possibly succeed."""
+    from packages.ml.data.store import connect
+
+    with connect() as con:
+        _seed_one_game(con)
+
+    samples = sample_positions(
+        n_samples=10,
+        classification_weights={"blunder": 0.5, "great": 0.5},
+        min_ply=1,
+    )
+    # Pad to ensure we have at least 6 samples so we can trip the abort threshold.
+    samples = samples * 3
+
+    client = _QuotaClient()
+    stats = generate_explanations(
+        samples, client, max_retries=0, quota_abort_after=3
+    )
+
+    assert stats.aborted_quota is True
+    # We should have given up well before consuming all samples.
+    assert client.raised <= 5  # 3 abort threshold + small slop
+
+
 def test_generate_explanations_idempotent_overwrite(tmp_db) -> None:
     """Re-running the generator on the same sample replaces the row, doesn't double."""
     from packages.ml.data.store import connect
